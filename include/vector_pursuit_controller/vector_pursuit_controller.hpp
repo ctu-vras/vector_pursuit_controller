@@ -332,6 +332,8 @@ protected:
   bool use_rotate_to_heading_;
   double max_angular_accel_;
   double max_linear_accel_;
+  double max_linear_decel_;
+  double approach_deceleration_gain_;
   double rotate_to_heading_min_angle_;
   double goal_dist_tol_;
   double max_robot_pose_search_dist_;

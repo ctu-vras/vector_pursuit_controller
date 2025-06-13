@@ -31,6 +31,61 @@
 using nav2_util::declare_parameter_if_not_declared;
 using nav2_util::geometry_utils::euclidean_distance;
 using rcl_interfaces::msg::ParameterType;
+using NodeParamInterfacePtr = rclcpp::node_interfaces::NodeParametersInterface::SharedPtr;
+using rcl_interfaces::msg::ParameterDescriptor;
+
+// This function is added in nav2_util 1.3.7
+template<typename ParamType>
+ParamType declare_or_get_parameter(
+  const rclcpp::Logger & logger, NodeParamInterfacePtr param_interface,
+  const std::string & parameter_name, const ParamType & default_value,
+  bool warn_if_no_override = false, bool strict_param_loading = false,
+  const ParameterDescriptor & parameter_descriptor = ParameterDescriptor())
+{
+  if (param_interface->has_parameter(parameter_name)) {
+    rclcpp::Parameter param(parameter_name, default_value);
+    param_interface->get_parameter(parameter_name, param);
+    return param.get_value<ParamType>();
+  }
+
+  auto return_value = param_interface
+    ->declare_parameter(parameter_name, rclcpp::ParameterValue{default_value},
+      parameter_descriptor)
+    .get<ParamType>();
+
+  const bool no_param_override = param_interface->get_parameter_overrides().find(parameter_name) ==
+    param_interface->get_parameter_overrides().end();
+  if (no_param_override) {
+    if (warn_if_no_override) {
+      RCLCPP_WARN_STREAM(
+            logger,
+            "Failed to get param " << parameter_name << " from overrides, using default value.");
+    }
+    if (strict_param_loading) {
+      std::string description = "Parameter " + parameter_name +
+        " not in overrides and strict_param_loading is True";
+      throw rclcpp::exceptions::InvalidParameterValueException(description.c_str());
+    }
+  }
+
+  return return_value;
+}
+
+template<typename ParamType, typename NodeT>
+ParamType declare_or_get_parameter(
+  NodeT node, const std::string & parameter_name,
+  const ParamType & default_value,
+  const ParameterDescriptor & parameter_descriptor = ParameterDescriptor())
+{
+  declare_parameter_if_not_declared(node, "warn_on_missing_params", rclcpp::ParameterValue(false));
+  bool warn_if_no_override{false};
+  node->get_parameter("warn_on_missing_params", warn_if_no_override);
+  declare_parameter_if_not_declared(node, "strict_param_loading", rclcpp::ParameterValue(false));
+  bool strict_param_loading{false};
+  node->get_parameter("strict_param_loading", strict_param_loading);
+  return declare_or_get_parameter(node->get_logger(), node->get_node_parameters_interface(),
+    parameter_name, default_value, warn_if_no_override, strict_param_loading, parameter_descriptor);
+}
 
 namespace vector_pursuit_controller
 {
@@ -68,6 +123,8 @@ void VectorPursuitController::configure(
     node, plugin_name_ + ".min_approach_linear_velocity", rclcpp::ParameterValue(0.05));
   declare_parameter_if_not_declared(
     node, plugin_name_ + ".approach_velocity_scaling_dist", rclcpp::ParameterValue(1.0));
+  declare_parameter_if_not_declared(
+    node, plugin_name_ + ".approach_deceleration_gain", rclcpp::ParameterValue(1.0));
   declare_parameter_if_not_declared(
     node, plugin_name_ + ".min_lookahead_dist", rclcpp::ParameterValue(0.3));
   declare_parameter_if_not_declared(
@@ -109,8 +166,10 @@ void VectorPursuitController::configure(
     node, plugin_name_ + ".rotate_to_heading_angular_vel", rclcpp::ParameterValue(1.8));
   declare_parameter_if_not_declared(
     node, plugin_name_ + ".max_angular_accel", rclcpp::ParameterValue(3.2));
+  max_linear_accel_ = declare_or_get_parameter(
+    node, plugin_name_ + ".max_linear_accel", 2.0);
   declare_parameter_if_not_declared(
-    node, plugin_name_ + ".max_linear_accel", rclcpp::ParameterValue(2.0));
+    node, plugin_name_ + ".max_linear_decel", rclcpp::ParameterValue(-max_linear_accel_));
   declare_parameter_if_not_declared(
     node, plugin_name_ + ".max_lateral_accel", rclcpp::ParameterValue(0.5));
   declare_parameter_if_not_declared(
@@ -165,7 +224,8 @@ void VectorPursuitController::configure(
   node->get_parameter(plugin_name_ + ".use_rotate_to_heading", use_rotate_to_heading_);
   node->get_parameter(plugin_name_ + ".rotate_to_heading_min_angle", rotate_to_heading_min_angle_);
   node->get_parameter(plugin_name_ + ".max_angular_accel", max_angular_accel_);
-  node->get_parameter(plugin_name_ + ".max_linear_accel", max_linear_accel_);
+  node->get_parameter(plugin_name_ + ".max_linear_decel", max_linear_decel_);
+  node->get_parameter(plugin_name_ + ".approach_deceleration_gain", approach_deceleration_gain_);
   node->get_parameter(plugin_name_ + ".max_lateral_accel", max_lateral_accel_);
   node->get_parameter("controller_frequency", control_frequency);
   node->get_parameter(
@@ -448,8 +508,24 @@ void VectorPursuitController::applyApproachVelocityScaling(
     approach_vel = unbounded_vel;
   }
 
+  double stopping_vel = linear_vel;
+  if (max_linear_decel_ < 0.0) {
+    const auto remaining_distance = std::max(
+      0.0, nav2_util::geometry_utils::calculate_path_length(path) - goal_dist_tol_);
+    const auto dist_traveled_until_stop =
+      std::pow(linear_vel, 2.0) / (2 * std::abs(max_linear_decel_));
+    const auto decel = approach_deceleration_gain_ * max_linear_decel_;
+    if (remaining_distance < dist_traveled_until_stop) {
+      if (dist_traveled_until_stop > 2 * remaining_distance) {
+        RCLCPP_WARN_THROTTLE(logger_, *(clock_), 10000,
+          "The robot is decelerating too slowly. Consider increasing approach_deceleration_gain.");
+      }
+      stopping_vel += std::copysign(1.0, linear_vel) * decel * control_duration_;
+    }
+  }
+
   // Use the lowest velocity between approach and other constraints, if all overlapping
-  linear_vel = std::min(linear_vel, approach_vel);
+  linear_vel = std::min({linear_vel, approach_vel, stopping_vel});
 }
 
 void VectorPursuitController::applyConstraints(
@@ -1003,6 +1079,10 @@ rcl_interfaces::msg::SetParametersResult VectorPursuitController::dynamicParamet
         max_lateral_accel_ = parameter.as_double();
       } else if (name == plugin_name_ + ".max_linear_accel") {
         max_linear_accel_ = parameter.as_double();
+      } else if (name == plugin_name_ + ".max_linear_decel") {
+        max_linear_decel_ = parameter.as_double();
+      } else if (name == plugin_name_ + ".approach_deceleration_gain") {
+        approach_deceleration_gain_ = parameter.as_double();
       }
     } else if (type == ParameterType::PARAMETER_BOOL) {
       if (name == plugin_name_ + ".use_velocity_scaled_lookahead_dist") {
