@@ -34,6 +34,8 @@
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/quaternion.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 namespace vector_pursuit_controller
 {
@@ -120,6 +122,14 @@ public:
    * @param target_pose The target pose to calculate the turning radius
    * @return The turning radius of the robot
    */
+  double calcTurningRadiusNew(
+    const geometry_msgs::msg::PoseStamped & target_pose,
+    const geometry_msgs::msg::PoseStamped & pose);
+
+    double calcTurningRadius(
+    const geometry_msgs::msg::PoseStamped & target_pose,
+    const geometry_msgs::msg::PoseStamped & pose);
+
   double calcTurningRadius(
     const geometry_msgs::msg::PoseStamped & target_pose);
 
@@ -308,6 +318,7 @@ protected:
   rclcpp::Logger logger_ {rclcpp::get_logger("VectorPursuitController")};
   rclcpp::Clock::SharedPtr clock_;
 
+  double time_last_called_;
   double k_;
   double desired_linear_vel_, base_desired_linear_vel_;
   double lookahead_dist_;
@@ -339,6 +350,7 @@ protected:
   double max_robot_pose_search_dist_;
   bool use_interpolation_;
   bool allow_reversing_;
+  bool original_implementation_;
   bool is_reversing_;
   bool use_heading_from_path_;
 
@@ -349,6 +361,7 @@ protected:
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>>
   target_pub_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>> target_arc_pub_;
+  std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<visualization_msgs::msg::MarkerArray>> screw_pub_;
   std::unique_ptr<nav2_costmap_2d::FootprintCollisionChecker<nav2_costmap_2d::Costmap2D *>>
   collision_checker_;
 

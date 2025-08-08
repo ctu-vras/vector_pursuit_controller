@@ -22,6 +22,9 @@
 #include <utility>
 #include <cmath>
 
+#include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <geometry_msgs/msg/point.hpp>
 #include "vector_pursuit_controller/vector_pursuit_controller.hpp"
 #include "angles/angles.h"
 #include "nav2_core/planner_exceptions.hpp"
@@ -86,6 +89,113 @@ ParamType declare_or_get_parameter(
   return declare_or_get_parameter(node->get_logger(), node->get_node_parameters_interface(),
     parameter_name, default_value, warn_if_no_override, strict_param_loading, parameter_descriptor);
 }
+
+// Returns intersection point as {x, y} if it exists
+// Otherwise returns std::nullopt for parallel lines
+std::optional<std::pair<double, double>> intersectLines(
+    double x1, double y1, double x2, double y2,
+    double x3, double y3, double x4, double y4)
+{
+    // Line 1: (x1, y1) to (x2, y2)
+    // Line 2: (x3, y3) to (x4, y4)
+    double denom = (x1 - x2) * (y3 - y4) - 
+                   (y1 - y2) * (x3 - x4);
+
+    if (denom == 0.0) {
+        // Parallel or coincident
+        return std::nullopt;
+    }
+
+    double px = ((x1*y2 - y1*x2) * (x3 - x4) -
+                 (x1 - x2) * (x3*y4 - y3*x4)) / denom;
+
+    double py = ((x1*y2 - y1*x2) * (y3 - y4) -
+                 (y1 - y2) * (x3*y4 - y3*x4)) / denom;
+
+    return std::make_pair(px, py);
+}
+
+visualization_msgs::msg::MarkerArray combineMarkerArrays(
+    const visualization_msgs::msg::MarkerArray &a,
+    const visualization_msgs::msg::MarkerArray &b)
+{
+    visualization_msgs::msg::MarkerArray combined;
+    combined.markers.reserve(a.markers.size() + b.markers.size());
+
+    combined.markers.insert(combined.markers.end(), a.markers.begin(), a.markers.end());
+    combined.markers.insert(combined.markers.end(), b.markers.begin(), b.markers.end());
+
+    return combined;
+}
+
+visualization_msgs::msg::MarkerArray makeCircleWithRadiusMarkerArray(
+    double cx, double cy, double radius, double angle_rad,
+    const std::string & frame_id, double r, double g, double b, int id,
+    int segments = 50)
+{
+    visualization_msgs::msg::MarkerArray array;
+
+    // ----- Circle Marker -----
+    visualization_msgs::msg::Marker circle;
+    circle.header.frame_id = frame_id;
+    circle.header.stamp = rclcpp::Clock().now();
+    circle.ns = "circle"+std::to_string(id);
+    circle.id = id;
+    circle.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    circle.action = visualization_msgs::msg::Marker::ADD;
+
+    circle.scale.x = 0.02; // line width
+
+    circle.color.r = r;
+    circle.color.g = g;
+    circle.color.b = b;
+    circle.color.a = 0.5;
+
+    for (int i = 0; i <= segments; ++i)
+    {
+        double theta = 2.0 * M_PI * i / segments;
+        geometry_msgs::msg::Point p;
+        p.x = cx + radius * cos(theta);
+        p.y = cy + radius * sin(theta);
+        p.z = 0.0;
+        circle.points.push_back(p);
+    }
+    array.markers.push_back(circle);
+
+    // ----- Radius Line Marker -----
+    visualization_msgs::msg::Marker radius_line;
+    radius_line.header.frame_id = frame_id;
+    radius_line.header.stamp = rclcpp::Clock().now();
+    radius_line.ns = "radius_line"+std::to_string(id);
+    radius_line.id = id + 100;
+    radius_line.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    radius_line.action = visualization_msgs::msg::Marker::ADD;
+
+    radius_line.scale.x = 0.02;
+
+    radius_line.color.r = 0.0;
+    radius_line.color.g = 1.0;
+    radius_line.color.b = 0.0;
+    radius_line.color.a = 1.0;
+
+    geometry_msgs::msg::Point p_center;
+    p_center.x = cx;
+    p_center.y = cy;
+    p_center.z = 0.0;
+
+    geometry_msgs::msg::Point p_end;
+    p_end.x = cx + radius * cos(angle_rad);
+    p_end.y = cy + radius * sin(angle_rad);
+    p_end.z = 0.0;
+
+    radius_line.points.push_back(p_center);
+    radius_line.points.push_back(p_end);
+
+    array.markers.push_back(radius_line);
+
+    return array;
+}
+
 
 namespace vector_pursuit_controller
 {
@@ -153,6 +263,9 @@ void VectorPursuitController::configure(
     node, plugin_name_ + ".allow_reversing",
     rclcpp::ParameterValue(false));
   declare_parameter_if_not_declared(
+    node, plugin_name_ + ".original_implementation",
+    rclcpp::ParameterValue(false));
+  declare_parameter_if_not_declared(
     node, plugin_name_ + ".cost_scaling_dist", rclcpp::ParameterValue(0.6));
   declare_parameter_if_not_declared(
     node, plugin_name_ + ".cost_scaling_gain", rclcpp::ParameterValue(1.0));
@@ -216,6 +329,7 @@ void VectorPursuitController::configure(
     plugin_name_ + ".use_cost_regulated_linear_velocity_scaling",
     use_cost_regulated_linear_velocity_scaling_);
   node->get_parameter(plugin_name_ + ".allow_reversing", allow_reversing_);
+  node->get_parameter(plugin_name_ + ".original_implementation", original_implementation_);
   node->get_parameter(plugin_name_ + ".cost_scaling_dist", cost_scaling_dist_);
   node->get_parameter(plugin_name_ + ".cost_scaling_gain", cost_scaling_gain_);
   node->get_parameter(
@@ -241,6 +355,15 @@ void VectorPursuitController::configure(
   transform_tolerance_ = tf2::durationFromSec(transform_tolerance);
   control_duration_ = 1.0 / control_frequency;
 
+  if (original_implementation_) {
+    RCLCPP_WARN_ONCE(logger_,"Using original implementation of turning radius calculation. Use parameter k from (1,inf), where lower k signals more weight on orientation in lookahead point and higher k -> position. Current k = %f",k_);
+    if (k_ <= 1.0) {
+      RCLCPP_WARN_ONCE(logger_,"Current k = %f is too low, this will have undesirable side effects. Use parameter k from (1,inf).",k_);
+    }
+  } else {
+    RCLCPP_WARN_ONCE(logger_,"Using new implementation of turning radius calculation. Use parameter k from (0,inf), where lower k signals more weight on position in lookahead point and higher k -> orientation. Current k = %f",k_);
+  }
+
   if (inflation_cost_scaling_factor_ <= 0.0) {
     RCLCPP_WARN(
       logger_, "The value inflation_cost_scaling_factor is incorrectly set, "
@@ -263,6 +386,7 @@ void VectorPursuitController::configure(
   global_path_pub_ = node->create_publisher<nav_msgs::msg::Path>("received_global_plan", 1);
   target_pub_ = node->create_publisher<geometry_msgs::msg::PoseStamped>("lookahead_point", 1);
   target_arc_pub_ = node->create_publisher<nav_msgs::msg::Path>("lookahead_collision_arc", 1);
+  screw_pub_ = node->create_publisher<visualization_msgs::msg::MarkerArray>("screw", 1);
 
   // initialize collision checker and set costmap
   collision_checker_ = std::make_unique<nav2_costmap_2d::
@@ -280,6 +404,7 @@ void VectorPursuitController::cleanup()
   global_path_pub_.reset();
   target_pub_.reset();
   target_arc_pub_.reset();
+  screw_pub_.reset();
 }
 
 void VectorPursuitController::activate()
@@ -292,6 +417,7 @@ void VectorPursuitController::activate()
   global_path_pub_->on_activate();
   target_pub_->on_activate();
   target_arc_pub_->on_activate();
+  screw_pub_->on_activate();
   // Add callback for dynamic parameters
   auto node = node_.lock();
   dyn_params_handler_ = node->add_on_set_parameters_callback(
@@ -310,6 +436,7 @@ void VectorPursuitController::deactivate()
   global_path_pub_->on_deactivate();
   target_pub_->on_deactivate();
   target_arc_pub_->on_deactivate();
+  screw_pub_->on_deactivate();
   dyn_params_handler_.reset();
 }
 
@@ -324,8 +451,199 @@ double VectorPursuitController::getLookAheadDistance(
     lookahead_dist = std::abs(speed.linear.x) * lookahead_time_;
     lookahead_dist = std::clamp(lookahead_dist, min_lookahead_dist_, max_lookahead_dist_);
   }
-
   return lookahead_dist;
+}
+
+double VectorPursuitController::calcTurningRadiusNew(
+  const geometry_msgs::msg::PoseStamped & target_pose,
+  const geometry_msgs::msg::PoseStamped & pose)
+{
+  geometry_msgs::msg::PoseStamped robot_pose;
+  transformPose(global_plan_.header.frame_id, pose, robot_pose);
+  double x_vehicle = robot_pose.pose.position.x;
+  double y_vehicle = robot_pose.pose.position.y;
+
+  tf2::Quaternion q(
+      robot_pose.pose.orientation.x,
+      robot_pose.pose.orientation.y,
+      robot_pose.pose.orientation.z,
+      robot_pose.pose.orientation.w
+  );
+
+  double roll_vehicle, pitch_vehicle, yaw_vehicle, screw_x, screw_y;
+  screw_x = 0.;
+  screw_y = 0.;
+  tf2::Matrix3x3(q).getRPY(roll_vehicle, pitch_vehicle, yaw_vehicle);
+
+  // Calculate angle to lookahead point
+  double target_angle = angles::normalize_angle(tf2::getYaw(target_pose.pose.orientation));
+  double distance = std::hypot(target_pose.pose.position.x, target_pose.pose.position.y);
+  double turning_radius = 0.;
+
+  double phi=0.;
+
+  if (allow_reversing_ || target_pose.pose.position.x >= 0.0) {
+    if (std::abs(target_pose.pose.position.y) > 1e-6) {
+
+      double screw_t_rel_y = std::abs(std::pow(distance,2)/(2*target_pose.pose.position.y)); 
+
+      double a = screw_t_rel_y;
+      double b = screw_t_rel_y;
+      double c = distance;
+      phi = std::acos((std::pow(a,2) + std::pow(b,2) - std::pow(c,2))/(2*a*b));
+
+      if (target_pose.pose.position.y < 0) { // point is to the right of the vehicle
+        phi = -phi;
+      }
+
+      // RCLCPP_WARN(logger_, "   1 %f",2 * std::pow(target_pose.pose.position.y, 2) - std::pow(distance, 2));
+      // RCLCPP_WARN(logger_, "   2 %f",2 * target_pose.pose.position.x * target_pose.pose.position.y);
+      // RCLCPP_WARN(logger_, "phi1 %f",phi_1);
+      // RCLCPP_WARN(logger_, "   3 %f",std::pow(distance, 2));
+      // RCLCPP_WARN(logger_, "phi2 %f",phi_2);
+      // RCLCPP_WARN(logger_, "   targ %f",target_angle);
+      // RCLCPP_WARN(logger_, "    phi %f",phi);
+      // RCLCPP_WARN(logger_, "my  phi %f",my_phi);
+      // RCLCPP_WARN(logger_, "    L x %f",target_pose.pose.position.x);
+      // RCLCPP_WARN(logger_, "    L y %f",target_pose.pose.position.y);
+      // RCLCPP_WARN(logger_, "  scr x %f",screw_t_rel_x);
+      // RCLCPP_WARN(logger_, "  scr y %f",screw_t_rel_y);
+      // RCLCPP_WARN(logger_, "      a %f",a);
+      // RCLCPP_WARN(logger_, "      b %f",b);
+      // RCLCPP_WARN(logger_, "      c %f",c);
+      // RCLCPP_WARN(logger_, "  k_ %f",k_ * phi);
+      // RCLCPP_WARN(logger_, "  k_ %f",((k_ - 1) * phi));
+      // RCLCPP_WARN(logger_, "   ter1 %f",(((k_ - 1) * phi) + target_angle));
+
+      // RCLCPP_WARN(logger_, "screw_x %f",screw_x);
+      // RCLCPP_WARN(logger_, "screw_y %f",screw_y);
+      // RCLCPP_WARN(logger_, "  x_veh %f", x_vehicle);
+      // RCLCPP_WARN(logger_, "  y_veh %f", y_vehicle);
+      // RCLCPP_WARN(logger_, "yaw_veh %f", yaw_vehicle);
+      // RCLCPP_WARN(logger_, "ter2 %f",term_2);
+
+      double k = 1.;
+      if (target_pose.pose.position.y >= 0) {
+        k = k_ * std::pow((phi-target_angle),1) + 1;
+      } else {
+        k = -k_ * std::pow((phi-target_angle),1) + 1;
+      }
+
+      turning_radius = k * std::pow(distance,2)/(2*(std::abs(target_pose.pose.position.y)));
+      // RCLCPP_WARN(logger_, "k      %f", k);
+      // RCLCPP_WARN(logger_, "tr og  %f", std::pow(distance,2)/(2*(std::abs(target_pose.pose.position.y))));
+      // RCLCPP_WARN(logger_, "tr     %f", turning_radius);
+      turning_radius = std::max(turning_radius, min_turning_radius_);
+      // RCLCPP_WARN(logger_, "trmin  %f", turning_radius);
+
+      screw_x = x_vehicle + turning_radius * std::sin(yaw_vehicle);
+      screw_y = y_vehicle - turning_radius * std::cos(yaw_vehicle);
+
+      // RCLCPP_WARN(logger_, "Turning radius: %f", turning_radius);
+    } else {
+      // Handle case when target is directly ahead
+      turning_radius = std::numeric_limits<double>::max();
+    }
+  } else {
+    // If lookahead point is behind the robot, set turning radius to minimum
+    turning_radius = min_turning_radius_;
+  }
+
+  double screw_t_x = x_vehicle - std::pow(distance,2)/(2*target_pose.pose.position.y)*std::sin(yaw_vehicle); 
+  double screw_t_y = y_vehicle + std::pow(distance,2)/(2*target_pose.pose.position.y)*std::cos(yaw_vehicle); 
+  double screw_t_radius = std::hypot((screw_t_x-x_vehicle), (screw_t_y-y_vehicle)); 
+
+  auto screw_combined = makeCircleWithRadiusMarkerArray(screw_x, screw_y, turning_radius, phi, "gps_odom", 1.,0.,0.,1);
+  auto screw_translation = makeCircleWithRadiusMarkerArray(screw_t_x, screw_t_y, screw_t_radius, phi, "gps_odom", 0.,1.,0.,2);
+  auto marker_array = combineMarkerArrays(screw_combined,screw_translation);
+  screw_pub_->publish(marker_array);
+  
+  // Limit turning radius to avoid extremely sharp turns
+  turning_radius = std::max(turning_radius, min_turning_radius_);
+  RCLCPP_DEBUG(logger_, "Turning radius: %f", turning_radius);
+
+  return turning_radius;
+}
+
+
+double VectorPursuitController::calcTurningRadius(
+  const geometry_msgs::msg::PoseStamped & target_pose,
+  const geometry_msgs::msg::PoseStamped & pose)
+{
+  
+  // For visualization
+  geometry_msgs::msg::PoseStamped robot_pose;
+  transformPose(global_plan_.header.frame_id, pose, robot_pose);
+  double x_vehicle = robot_pose.pose.position.x;
+  double y_vehicle = robot_pose.pose.position.y;
+  tf2::Quaternion q(
+      robot_pose.pose.orientation.x,
+      robot_pose.pose.orientation.y,
+      robot_pose.pose.orientation.z,
+      robot_pose.pose.orientation.w
+  );
+  double roll_vehicle, pitch_vehicle, yaw_vehicle, screw_x, screw_y;
+  screw_x = 0.;
+  screw_y = 0.;
+  tf2::Matrix3x3(q).getRPY(roll_vehicle, pitch_vehicle, yaw_vehicle);
+
+  // Calculate angle to lookahead point
+  double target_angle = angles::normalize_angle(tf2::getYaw(target_pose.pose.orientation));
+  double distance = std::hypot(target_pose.pose.position.x, target_pose.pose.position.y);
+
+  // Compute turning radius (screw center)
+  double turning_radius;
+  double phi = 0.;
+  
+  if (allow_reversing_ || target_pose.pose.position.x >= 0.0) {
+    if (std::abs(target_pose.pose.position.y) > 1e-6) {
+
+      double phi_1 = std::atan2(
+        (2 * std::pow(target_pose.pose.position.y, 2) - std::pow(distance, 2)),
+        (2 * target_pose.pose.position.x * target_pose.pose.position.y));
+      double term_2 = std::pow(distance, 2) / (2 * target_pose.pose.position.y);
+      double phi_2 = std::atan2(term_2, 0.0);
+      // double phi_2 = std::atan2(std::pow(distance, 2), (2 * target_pose.pose.position.y));
+      phi = angles::normalize_angle_positive(phi_1 - phi_2);
+      // phi = angles::normalize_angle(phi_1 - phi_2);
+      phi = std::max(phi, 1.0e-9);
+
+      double term_1 = (k_ * phi) / (((k_ - 1) * phi) + target_angle);
+
+      turning_radius = std::abs(term_1 * term_2);
+
+      // RCLCPP_WARN(logger_, "  phi_1 %f",phi_1);
+      // RCLCPP_WARN(logger_, "  phi_2 %f",phi_2);
+      // RCLCPP_WARN(logger_, "    phi %f",phi);
+      // RCLCPP_WARN(logger_, "   targ %f",target_angle);
+      // RCLCPP_WARN(logger_, " term_1 %f",term_1);
+
+      screw_x = x_vehicle + turning_radius * std::sin(yaw_vehicle);
+      screw_y = y_vehicle - turning_radius * std::cos(yaw_vehicle);
+
+    } else {
+      // Handle case when target is directly ahead
+      turning_radius = std::numeric_limits<double>::max();
+    }
+  } else {
+    // If lookahead point is behind the robot, set turning radius to minimum
+    turning_radius = min_turning_radius_;
+  }
+
+  double screw_t_x = x_vehicle + std::pow(distance,2)/(2*target_pose.pose.position.y)*std::sin(yaw_vehicle); 
+  double screw_t_y = y_vehicle - std::pow(distance,2)/(2*target_pose.pose.position.y)*std::cos(yaw_vehicle); 
+  double screw_t_radius = std::hypot((screw_t_x-x_vehicle), (screw_t_y-y_vehicle)); 
+
+  auto screw_combined = makeCircleWithRadiusMarkerArray(screw_x, screw_y, turning_radius, phi, "gps_odom", 1.,0.,0.,1);
+  auto screw_translation = makeCircleWithRadiusMarkerArray(screw_t_x, screw_t_y, screw_t_radius, phi, "gps_odom", 0.,1.,0.,2);
+  auto marker_array = combineMarkerArrays(screw_combined,screw_translation);
+  screw_pub_->publish(marker_array);
+  
+  // Limit turning radius to avoid extremely sharp turns
+  turning_radius = std::max(turning_radius, min_turning_radius_);
+  RCLCPP_DEBUG(logger_, "Turning radius: %f", turning_radius);
+
+  return turning_radius;
 }
 
 double VectorPursuitController::calcTurningRadius(
@@ -342,9 +660,23 @@ double VectorPursuitController::calcTurningRadius(
         (2 * std::pow(target_pose.pose.position.y, 2) - std::pow(distance, 2)),
         (2 * target_pose.pose.position.x * target_pose.pose.position.y));
       double phi_2 = std::atan2(std::pow(distance, 2), (2 * target_pose.pose.position.y));
-      double phi = angles::normalize_angle(phi_1 - phi_2);
+      double phi = angles::normalize_angle_positive(phi_1 - phi_2);  // according to paper should be in [0,2pi) not [-pi,pi)...
       double term_1 = (k_ * phi) / (((k_ - 1) * phi) + target_angle);
       double term_2 = std::pow(distance, 2) / (2 * target_pose.pose.position.y);
+
+      // RCLCPP_WARN(logger_, "   1 %f",2 * std::pow(target_pose.pose.position.y, 2) - std::pow(distance, 2));
+      // RCLCPP_WARN(logger_, "   2 %f",2 * target_pose.pose.position.x * target_pose.pose.position.y);
+      // RCLCPP_WARN(logger_, "phi1 %f",phi_1);
+      // RCLCPP_WARN(logger_, "   3 %f",std::pow(distance, 2));
+      // RCLCPP_WARN(logger_, "   4 %f",2 * target_pose.pose.position.y);
+      // RCLCPP_WARN(logger_, "phi2 %f",phi_2);
+      RCLCPP_WARN(logger_, "    phi %f",phi);
+      RCLCPP_WARN(logger_, "   targ %f",target_angle);
+      // RCLCPP_WARN(logger_, "  k_ %f",k_ * phi);
+      // RCLCPP_WARN(logger_, "  k_ %f",((k_ - 1) * phi));
+      RCLCPP_WARN(logger_, "   ter1 %f",(((k_ - 1) * phi) + target_angle));
+
+      // RCLCPP_WARN(logger_, "ter2 %f",term_2);
       turning_radius = std::abs(term_1 * term_2);
     } else {
       // Handle case when target is directly ahead
@@ -358,6 +690,7 @@ double VectorPursuitController::calcTurningRadius(
   // Limit turning radius to avoid extremely sharp turns
   turning_radius = std::max(turning_radius, min_turning_radius_);
   RCLCPP_DEBUG(logger_, "Turning radius: %f", turning_radius);
+  RCLCPP_WARN(logger_, "Turning radius: %f", turning_radius);
 
   return turning_radius;
 }
@@ -370,6 +703,13 @@ geometry_msgs::msg::TwistStamped VectorPursuitController::computeVelocityCommand
   std::lock_guard<std::mutex> lock_reinit(mutex_);
   nav2_costmap_2d::Costmap2D * costmap = costmap_ros_->getCostmap();
   std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*(costmap->getMutex()));
+
+  double time_since_last_called = clock_->now().seconds() - time_last_called_;
+  if (time_since_last_called > 10.0) {
+    RCLCPP_WARN(logger_, "Time since last called is %f s which is higher than 10.0 s. Therefore, resetting last_cmd_vel to 0.0.", time_since_last_called);
+    last_cmd_vel_.linear.x = 0.0;
+    last_cmd_vel_.angular.z = 0.0;
+  }
 
   // Update goal tolerances
   geometry_msgs::msg::Pose pose_tolerance;
@@ -384,6 +724,7 @@ geometry_msgs::msg::TwistStamped VectorPursuitController::computeVelocityCommand
   auto transformed_plan = transformGlobalPlan(pose);
 
   // Find look ahead distance and point on path
+  // RCLCPP_WARN(logger_, "last_cmd_vel_ %f", last_cmd_vel_.linear.x);
   double lookahead_dist = getLookAheadDistance(last_cmd_vel_);
 
   // Cusp check
@@ -416,11 +757,17 @@ geometry_msgs::msg::TwistStamped VectorPursuitController::computeVelocityCommand
   } else if (shouldRotateToPath(lookahead_point, angle_to_heading, sign)) {
     rotateToHeading(linear_vel, angular_vel, angle_to_heading, last_cmd_vel_);
   } else {
-    double turning_radius = calcTurningRadius(lookahead_point);
+    double turning_radius = std::numeric_limits<double>::max();
+    if (original_implementation_) {
+      turning_radius = calcTurningRadius(lookahead_point, pose);
+    } else {
+      turning_radius = calcTurningRadiusNew(lookahead_point, pose);
+    }
 
     // Compute linear velocity based on path curvature
     double curvature = 1.0 / turning_radius;
 
+    // RCLCPP_WARN(logger_, "SIGN %f", sign);
     applyConstraints(
       curvature, last_cmd_vel_,
       costAtPose(pose.pose.position.x, pose.pose.position.y), linear_vel, transformed_plan, sign);
@@ -430,6 +777,46 @@ geometry_msgs::msg::TwistStamped VectorPursuitController::computeVelocityCommand
     if (lookahead_point.pose.position.y < 0) {
       angular_vel *= -1;
     }
+    // RCLCPP_WARN(logger_, "angular_vel %f", angular_vel);
+
+    const double & dt = control_duration_;
+    const double min_feasible_angular_speed = last_cmd_vel_.angular.z - max_angular_accel_ * dt;
+    const double max_feasible_angular_speed = last_cmd_vel_.angular.z + max_angular_accel_ * dt;
+
+    // RCLCPP_WARN(logger_, "last_cmd_vel_.angular.z %f", last_cmd_vel_.angular.z);
+
+    angular_vel = std::clamp(angular_vel, min_feasible_angular_speed, max_feasible_angular_speed);
+
+    // RCLCPP_WARN(logger_, "angular_vel clamped %f between %f and %f", angular_vel, min_feasible_angular_speed, max_feasible_angular_speed);
+
+    
+
+    // int angular_vel_sign = 1;
+    // if (lookahead_point.pose.position.y < 0) {  
+    //   int angular_vel_sign = -1;
+    // }
+
+    // int angular_vel_sign_prev = 1;
+    // if (last_cmd_vel_.angular.z < 0) {  
+    //   int angular_vel_sign_prev = -1;
+    // }
+
+    // angular_vel = linear_vel / turning_radius;
+
+    // const double & dt = control_duration_;
+
+    // const double min_feasible_angular_speed = last_cmd_vel_.angular.z - max_angular_accel_ * dt;
+    // const double max_feasible_angular_speed = last_cmd_vel_.angular.z + max_angular_accel_ * dt;
+
+    // if (angular_vel_sign > 0 && angular_vel_sign_prev > 0) {
+    //   angular_vel = std::clamp(angular_vel, min_feasible_angular_speed, max_feasible_angular_speed);
+    // } else if (angular_vel_sign > 0 && angular_vel_sign_prev < 0) {
+    //   angular_vel = std::clamp(angular_vel, min_feasible_angular_speed, max_feasible_angular_speed);
+    // } else if (angular_vel_sign < 0 && angular_vel_sign_prev < 0) {
+    //   angular_vel = std::clamp(angular_vel, min_feasible_angular_speed, max_feasible_angular_speed);
+    // } else {
+    //   angular_vel = std::clamp(angular_vel, min_feasible_angular_speed, max_feasible_angular_speed);
+    // }
   }
 
   // Collision checking
@@ -456,6 +843,9 @@ geometry_msgs::msg::TwistStamped VectorPursuitController::computeVelocityCommand
   // Use speed instead when branch with the fix is merged.
   last_cmd_vel_ = speed;
   last_cmd_vel_ = cmd_vel.twist;
+
+  time_last_called_ = clock_->now().seconds();
+
   return cmd_vel;
 }
 
@@ -552,15 +942,31 @@ void VectorPursuitController::applyConstraints(
   double max_vel_for_curve = std::sqrt(max_lateral_accel_ / std::abs(curvature));
 
   // Apply constraints
-  linear_vel = std::min(
+  if (sign > 0.0) {
+    linear_vel = std::min(
     {linear_vel, max_vel_for_curve, cost_vel,
-      std::abs(curr_speed.linear.x) + max_linear_accel_ * control_duration_});
+      curr_speed.linear.x + max_linear_accel_ * control_duration_});
 
-  applyApproachVelocityScaling(path, linear_vel);
+    applyApproachVelocityScaling(path, linear_vel);
 
-  // Ensure the linear velocity is not below the minimum allowed linear velocity
-  linear_vel = std::max(linear_vel, min_linear_velocity_);
-  linear_vel = sign * linear_vel;
+    // Ensure the linear velocity is not below the minimum allowed linear velocity
+    // linear_vel = std::max(linear_vel, min_linear_velocity_);
+  } else {
+    linear_vel = std::max(
+    {-linear_vel, -max_vel_for_curve, -cost_vel,
+      curr_speed.linear.x - max_linear_accel_ * control_duration_});
+
+    applyApproachVelocityScaling(path, linear_vel);
+
+    // Ensure the linear velocity is not below the minimum allowed linear velocity
+    // linear_vel = std::min(linear_vel, -min_linear_velocity_);
+  }
+
+  if (std::abs(linear_vel) < min_linear_velocity_ && linear_vel > 0.0) {
+    linear_vel = min_linear_velocity_;
+  } else if (std::abs(linear_vel) < min_linear_velocity_ && linear_vel <= 0.0) {
+    linear_vel = -min_linear_velocity_;
+  }
 }
 
 bool VectorPursuitController::shouldRotateToPath(
@@ -731,6 +1137,8 @@ geometry_msgs::msg::PoseStamped VectorPursuitController::getLookAheadPoint(
 
 void VectorPursuitController::setPlan(const nav_msgs::msg::Path & path)
 {
+  RCLCPP_WARN(logger_, "Setting global plan in VectorPursuitController");
+  
   global_plan_ = path;
 }
 
@@ -1093,6 +1501,8 @@ rcl_interfaces::msg::SetParametersResult VectorPursuitController::dynamicParamet
         use_rotate_to_heading_ = parameter.as_bool();
       } else if (name == plugin_name_ + ".allow_reversing") {
         allow_reversing_ = parameter.as_bool();
+      } else if (name == plugin_name_ + ".original_implementation") {
+        original_implementation_ = parameter.as_bool();
       } else if (name == plugin_name_ + ".use_collision_detection") {
         use_collision_detection_ = parameter.as_bool();
       } else if (name == plugin_name_ + ".use_interpolation") {
