@@ -722,18 +722,35 @@ geometry_msgs::msg::TwistStamped VectorPursuitController::computeVelocityCommand
 
   // Transform path to robot base frame
   auto transformed_plan = transformGlobalPlan(pose);
+  
+  
+  // TODO implement this properly !!!
+  // The goal here is to account for the robot moving between calling the planner
+  // and the planner returning the plan. Ideally we would measure how far the robot went
+  // during that time and remove that much from the plan. This is just an improvised version.
+  if (transformed_plan.poses.size() > 1) {
+    transformed_plan.poses.erase(transformed_plan.poses.begin(), transformed_plan.poses.begin() + 1);
+  } 
+
+
 
   // Find look ahead distance and point on path
   // RCLCPP_WARN(logger_, "last_cmd_vel_ %f", last_cmd_vel_.linear.x);
   double lookahead_dist = getLookAheadDistance(last_cmd_vel_);
 
+  // !!! FOR NOW DO NOT CONSIDER CUSP POINTS !!!
+
+  // RCLCPP_WARN(logger_, "lookahead dist: %f", lookahead_dist);
+
   // Cusp check
-  const double dist_to_cusp = getCuspDist(transformed_plan);
+  // const double dist_to_cusp = getCuspDist(transformed_plan);
+
+  // RCLCPP_WARN(logger_, "lookahead dist: %f", dist_to_cusp);
 
   // if the lookahead distance is further than the cusp, use the cusp distance instead
-  if (dist_to_cusp < lookahead_dist) {
-    lookahead_dist = dist_to_cusp;
-  }
+  // if (dist_to_cusp < lookahead_dist) {
+  //   lookahead_dist = dist_to_cusp;
+  // }
 
   auto lookahead_point = getLookAheadPoint(lookahead_dist, transformed_plan);
 
