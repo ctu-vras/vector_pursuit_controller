@@ -143,6 +143,11 @@ public:
   void setSpeedLimit(const double & speed_limit, const bool & percentage) override;
 
 protected:
+  nav_msgs::msg::Path transformPath(
+      const nav_msgs::msg::Path & input_path,
+      const std::string & target_frame,
+    std::vector<geometry_msgs::msg::PoseStamped>::iterator begin,
+    std::vector<geometry_msgs::msg::PoseStamped>::iterator end);
   /**
    * @brief Transforms global plan into same frame as pose and clips poses ineligible for lookaheadPoint
    * Points ineligible to be selected as a lookahead point if they are any of the following:

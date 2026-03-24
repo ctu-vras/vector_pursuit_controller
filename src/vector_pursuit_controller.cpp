@@ -1348,6 +1348,44 @@ void VectorPursuitController::setSpeedLimit(
   }
 }
 
+nav_msgs::msg::Path VectorPursuitController::transformPath(
+      const nav_msgs::msg::Path & input_path,
+      const std::string & target_frame,
+      std::vector<geometry_msgs::msg::PoseStamped>::iterator begin,
+      std::vector<geometry_msgs::msg::PoseStamped>::iterator end)
+  {
+    nav_msgs::msg::Path output_path;
+
+    output_path.header = input_path.header;
+    output_path.header.frame_id = target_frame;
+
+    geometry_msgs::msg::TransformStamped transform;
+
+    try
+    {
+      transform = tf_buffer_->lookupTransform(
+          target_frame,
+          input_path.header.frame_id,
+          tf2::TimePointZero);
+    }
+    catch (tf2::TransformException & ex)
+    {
+      RCLCPP_WARN(logger_, "Transform failed: %s", ex.what());
+      return output_path;
+    }
+
+    for (auto it{begin}; it != end; it++)
+    {
+      geometry_msgs::msg::PoseStamped transformed_pose;
+
+      tf2::doTransform(*it, transformed_pose, transform);
+
+      output_path.poses.push_back(transformed_pose);
+    }
+
+    return output_path;
+  }
+
 nav_msgs::msg::Path VectorPursuitController::transformGlobalPlan(
   const geometry_msgs::msg::PoseStamped & pose)
 {
@@ -1386,22 +1424,30 @@ nav_msgs::msg::Path VectorPursuitController::transformGlobalPlan(
     });
 
   // Lambda to transform a PoseStamped from global frame to local
-  auto transformGlobalPoseToLocal = [&](const auto & global_plan_pose) {
-      geometry_msgs::msg::PoseStamped stamped_pose, transformed_pose;
-      stamped_pose.header.frame_id = global_plan_.header.frame_id;
-      stamped_pose.header.stamp = robot_pose.header.stamp;
-      stamped_pose.pose = global_plan_pose.pose;
-      transformPose(costmap_ros_->getBaseFrameID(), stamped_pose, transformed_pose);
-      transformed_pose.pose.position.z = 0.0;
-      return transformed_pose;
-    };
+  // auto transformGlobalPoseToLocal = [&](const auto & global_plan_pose) {
+  //     geometry_msgs::msg::PoseStamped stamped_pose, transformed_pose;
+  //     stamped_pose.header.frame_id = global_plan_.header.frame_id;
+  //     stamped_pose.header.stamp = robot_pose.header.stamp;
+  //     stamped_pose.pose = global_plan_pose.pose;
+  //     transformPose(costmap_ros_->getBaseFrameID(), stamped_pose, transformed_pose);
+  //     transformed_pose.pose.position.z = 0.0;
+  //     return transformed_pose;
+  //   };
 
   // Transform the near part of the global plan into the robot's frame of reference.
-  nav_msgs::msg::Path transformed_plan;
-  std::transform(
-    transformation_begin, transformation_end,
-    std::back_inserter(transformed_plan.poses),
-    transformGlobalPoseToLocal);
+  // nav_msgs::msg::Path transformed_plan;
+  // std::transform(
+  //   transformation_begin, transformation_end,
+  //   std::back_inserter(transformed_plan.poses),
+  //   transformGlobalPoseToLocal);
+
+  nav_msgs::msg::Path transformed_plan = transformPath(
+      global_plan_,
+      "base_link",
+      transformation_begin,
+      transformation_end);
+
+      
   transformed_plan.header.frame_id = costmap_ros_->getBaseFrameID();
   transformed_plan.header.stamp = robot_pose.header.stamp;
 
