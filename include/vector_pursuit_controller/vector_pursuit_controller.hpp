@@ -347,6 +347,7 @@ protected:
   double inflation_cost_scaling_factor_;
   bool use_rotate_to_heading_;
   double max_angular_accel_;
+  double max_angular_vel_;
   double max_linear_accel_;
   double max_linear_decel_;
   double approach_deceleration_gain_;

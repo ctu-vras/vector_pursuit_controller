@@ -279,6 +279,8 @@ void VectorPursuitController::configure(
     node, plugin_name_ + ".rotate_to_heading_angular_vel", rclcpp::ParameterValue(1.8));
   declare_parameter_if_not_declared(
     node, plugin_name_ + ".max_angular_accel", rclcpp::ParameterValue(3.2));
+  declare_parameter_if_not_declared(
+    node, plugin_name_ + ".max_angular_vel", rclcpp::ParameterValue(3.14));
   max_linear_accel_ = declare_or_get_parameter(
     node, plugin_name_ + ".max_linear_accel", 2.0);
   declare_parameter_if_not_declared(
@@ -338,6 +340,7 @@ void VectorPursuitController::configure(
   node->get_parameter(plugin_name_ + ".use_rotate_to_heading", use_rotate_to_heading_);
   node->get_parameter(plugin_name_ + ".rotate_to_heading_min_angle", rotate_to_heading_min_angle_);
   node->get_parameter(plugin_name_ + ".max_angular_accel", max_angular_accel_);
+  node->get_parameter(plugin_name_ + ".max_angular_vel", max_angular_vel_);
   node->get_parameter(plugin_name_ + ".max_linear_decel", max_linear_decel_);
   node->get_parameter(plugin_name_ + ".approach_deceleration_gain", approach_deceleration_gain_);
   node->get_parameter(plugin_name_ + ".max_lateral_accel", max_lateral_accel_);
@@ -797,8 +800,8 @@ geometry_msgs::msg::TwistStamped VectorPursuitController::computeVelocityCommand
     // RCLCPP_WARN(logger_, "angular_vel %f", angular_vel);
 
     const double & dt = control_duration_;
-    const double min_feasible_angular_speed = last_cmd_vel_.angular.z - max_angular_accel_ * dt;
-    const double max_feasible_angular_speed = last_cmd_vel_.angular.z + max_angular_accel_ * dt;
+    const double min_feasible_angular_speed = std::max({-max_angular_vel_, last_cmd_vel_.angular.z - max_angular_accel_ * dt});
+    const double max_feasible_angular_speed = std::min({max_angular_vel_, last_cmd_vel_.angular.z + max_angular_accel_ * dt});
 
     // RCLCPP_WARN(logger_, "last_cmd_vel_.angular.z %f", last_cmd_vel_.angular.z);
 
@@ -1536,6 +1539,8 @@ rcl_interfaces::msg::SetParametersResult VectorPursuitController::dynamicParamet
         transform_tolerance_ = tf2::durationFromSec(transform_tolerance);
       } else if (name == plugin_name_ + ".max_angular_accel") {
         max_angular_accel_ = parameter.as_double();
+      } else if (name == plugin_name_ + ".max_angular_vel") {
+        max_angular_vel_ = parameter.as_double();
       } else if (name == plugin_name_ + ".rotate_to_heading_min_angle") {
         rotate_to_heading_min_angle_ = parameter.as_double();
       } else if (name == plugin_name_ + ".k") {
